@@ -255,7 +255,7 @@ class ShareMode(Mode):
         self.history.update(event["data"]["id"], event["data"]["bytes"])
 
         # Is the download complete?
-        if event["data"]["bytes"] == self.web.share_mode.filesize:
+        if event["data"]["bytes"] == event["data"]["total_bytes"]:
             self.system_tray.showMessage(strings._('systray_share_completed_title'), strings._('systray_share_completed_message'))
 
             # Update completed and in progress labels
