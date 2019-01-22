@@ -6,6 +6,7 @@ import tempfile
 import zipfile
 import mimetypes
 import gzip
+import traceback
 
 from datetime import datetime
 from flask import Response, request, render_template, make_response, abort
@@ -203,6 +204,11 @@ class ShareModeWeb(object):
                 r = make_response(render_template('denied.html'))
                 return self.web.add_security_headers(r)
 
+            # Log request headers
+            self.common.log('ShareModeWeb', 'download_logic', 'request headers: {}'.format(
+                str(request.headers).strip().split('\r\n'))
+            )
+
             # Each download has a unique id
             download_id = self.download_count
             self.download_count += 1
@@ -267,11 +273,11 @@ class ShareModeWeb(object):
 
             r.status_code = status_code
 
+            self.common.log('ShareModeWeb', 'download_logic', 'response range={}, status_code={}, headers={}'.format(
+                range_, status_code, str(r.headers).strip().split('\r\n')))
             return r
 
-    @classmethod
-    def get_range_and_status_code(cls, dl_size, etag, last_modified):
-        print("---------")
+    def get_range_and_status_code(self, dl_size, etag, last_modified):
         use_default_range = True
         status_code = 200
         range_header = request.headers.get('Range')
@@ -285,8 +291,9 @@ class ShareModeWeb(object):
 
             if range_header:
                 if_range = request.headers.get('If-Range')
-                print('HEADER {}'.format(if_range))
-                print('ETAG {}'.format(etag))
+                self.common.log('ShareModeWeb', 'get_range_and_status_code', 'range header: {}'.format(range_header))
+                self.common.log('ShareModeWeb', 'get_range_and_status_code', 'if-range header: {}'.format(if_range))
+                self.common.log('ShareModeWeb', 'get_range_and_status_code', 'etag: {}'.format(etag))
                 if if_range and if_range != etag:
                     use_default_range = True
                     status_code = 200
@@ -295,19 +302,23 @@ class ShareModeWeb(object):
             ranges = [(0, dl_size - 1)]
 
         if len(ranges) > 1:
+            self.common.log('ShareModeWeb', 'get_range_and_status_code', 'aborting because multipart range')
             abort(416)  # We don't support multipart range requests yet
         range_ = ranges[0]
 
         etag_header = request.headers.get('ETag')
         if etag_header is not None and etag_header != etag:
+            self.common.log('ShareModeWeb', 'get_range_and_status_code', 'aborting because wrong etag header')
             abort(412)
 
         if_unmod = request.headers.get('If-Unmodified-Since')
         if if_unmod:
             if_date = parse_date(if_unmod)
             if if_date and if_date > last_modified:
+                self.common.log('ShareModeWeb', 'get_range_and_status_code', 'aborting because if-unmodified-since')
                 abort(412)
             elif range_header is None:
+                self.common.log('ShareModeWeb', 'get_range_and_status_code', 'setting status code to 304')
                 status_code = 304
 
         return range_, status_code
@@ -332,6 +343,7 @@ class ShareModeWeb(object):
         while not self.web.done:
             # The user has canceled the download, so stop serving the file
             if self.client_cancel:
+                self.common.log('ShareModeWeb', 'generate', 'OnionShare user stopped server, canceling')
                 self.web.add_request(self.web.REQUEST_CANCELED, request_path, {
                     'id': download_id
                 })
@@ -348,15 +360,18 @@ class ShareModeWeb(object):
                     # tell GUI the progress
                     # (this is technically inaccurate because a user could request just the
                     #  middle bytes, but we assume it's a Tor Browser "continue download")
-                    downloaded_bytes = fp.tell()
+                    downloaded_bytes = fp.tell() + start
                     percent = (1.0 * downloaded_bytes / filesize) * 100
                     bytes_left -= read_size
 
                     # only output to stdout if running onionshare in CLI mode, or if using Linux (#203, #304)
                     if not self.web.is_gui or self.common.platform == 'Linux' or self.common.platform == 'BSD':
+                        """
                         sys.stdout.write(
                             "\r{0:s}, {1:.2f}%          ".format(self.common.human_readable_filesize(downloaded_bytes), percent))
                         sys.stdout.flush()
+                        """
+                        print('#{0:d}: {1:s}, {2:.2f}%'.format(download_id, self.common.human_readable_filesize(downloaded_bytes), percent))
 
                     self.web.add_request(self.web.REQUEST_PROGRESS, request_path, {
                         'id': download_id,
@@ -365,19 +380,23 @@ class ShareModeWeb(object):
                         })
                     self.web.done = False
                 except:
+                    tb = traceback.format_exc()
+                    print(tb)
+
                     # looks like the download was canceled
                     self.web.done = True
                     canceled = True
 
                     # tell the GUI the download has canceled
+                    self.common.log('ShareModeWeb', 'generate', 'remote user canceled, it looks like')
                     self.web.add_request(self.web.REQUEST_CANCELED, request_path, {
                         'id': download_id
                     })
 
         fp.close()
 
-        if self.common.platform != 'Darwin':
-            sys.stdout.write("\n")
+        #if self.common.platform != 'Darwin':
+        #    sys.stdout.write("\n")
 
         # Download is finished
         if not self.web.stay_open:
@@ -393,7 +412,6 @@ class ShareModeWeb(object):
                 shutdown_func()
             except:
                 pass
-
 
     def set_file_info(self, filenames, processed_size_callback=None):
         """
