@@ -5,6 +5,7 @@ import subprocess
 import argparse
 import shutil
 import glob
+import itertools
 
 root = os.path.dirname(
     os.path.dirname(
@@ -17,6 +18,24 @@ root = os.path.dirname(
 
 def run(cmd, cwd=None):
     subprocess.run(cmd, cwd=cwd, check=True)
+
+
+def codesign(path, entitlements, identity):
+    run(
+        [
+            "codesign",
+            "--sign",
+            identity,
+            "--entitlements",
+            str(entitlements),
+            "--timestamp",
+            "--deep",
+            str(path),
+            "--force",
+            "--options",
+            "runtime",
+        ]
+    )
 
 
 def main():
@@ -61,31 +80,19 @@ def main():
         )
 
         print("○ Code signing app bundle")
-        run(
-            [
-                "codesign",
-                "--deep",
-                "-s",
-                identity_name_application,
-                "--force",
-                "--entitlements",
-                entitlements_child_filename,
-                "--timestamp",
-                app_path,
-            ]
-        )
-        run(
-            [
-                "codesign",
-                "-s",
-                identity_name_application,
-                "--force",
-                "--entitlements",
-                entitlements_filename,
-                "--timestamp",
-                app_path,
-            ]
-        )
+        for path in [
+            f"{app_path}/Contents/Resources/app/onionshare/resources/tor/libevent-2.1.7.dylib",
+            f"{app_path}/Contents/Resources/app/onionshare/resources/tor/obfs4proxy",
+            f"{app_path}/Contents/Resources/app/onionshare/resources/tor/tor",
+        ]:
+            codesign(path, entitlements_child_filename, identity_name_application)
+        for path in itertools.chain(
+            glob.glob(f"{app_path}/**/*.so", recursive=True),
+            glob.glob(f"{app_path}/**/*.dylib", recursive=True),
+            glob.glob(f"{app_path}/**/python3", recursive=True),
+            [app_path],
+        ):
+            codesign(path, entitlements_filename, identity_name_application)
         print(f"○ Signed app bundle: {app_path}")
 
         if not os.path.exists("/usr/local/bin/create-dmg"):
