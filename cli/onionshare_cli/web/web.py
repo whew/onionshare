@@ -2,7 +2,7 @@
 """
 OnionShare | https://onionshare.org/
 
-Copyright (C) 2014-2020 Micah Lee, et al. <micah@micahflee.com>
+Copyright (C) 2014-2021 Micah Lee, et al. <micah@micahflee.com>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -17,17 +17,12 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
-
-import hmac
 import logging
 import os
 import queue
-import socket
-import sys
-import tempfile
 import requests
+import shutil
 from distutils.version import LooseVersion as Version
-from urllib.request import urlopen
 
 import flask
 from flask import (
@@ -47,6 +42,7 @@ from .receive_mode import ReceiveModeWeb, ReceiveModeWSGIMiddleware, ReceiveMode
 from .website_mode import WebsiteModeWeb
 from .chat_mode import ChatModeWeb
 
+
 # Stub out flask's show_server_banner function, to avoiding showing warnings that
 # are not applicable to OnionShare
 def stubbed_show_server_banner(env, debug, app_import_path, eager_loading):
@@ -55,7 +51,7 @@ def stubbed_show_server_banner(env, debug, app_import_path, eager_loading):
 
 try:
     flask.cli.show_server_banner = stubbed_show_server_banner
-except:
+except Exception:
     pass
 
 
@@ -69,16 +65,17 @@ class Web:
     REQUEST_PROGRESS = 2
     REQUEST_CANCELED = 3
     REQUEST_RATE_LIMIT = 4
-    REQUEST_UPLOAD_FILE_RENAMED = 5
-    REQUEST_UPLOAD_SET_DIR = 6
-    REQUEST_UPLOAD_FINISHED = 7
-    REQUEST_UPLOAD_CANCELED = 8
-    REQUEST_INDIVIDUAL_FILE_STARTED = 9
-    REQUEST_INDIVIDUAL_FILE_PROGRESS = 10
-    REQUEST_INDIVIDUAL_FILE_CANCELED = 11
-    REQUEST_ERROR_DATA_DIR_CANNOT_CREATE = 12
-    REQUEST_OTHER = 13
-    REQUEST_INVALID_PASSWORD = 14
+    REQUEST_UPLOAD_INCLUDES_MESSAGE = 5
+    REQUEST_UPLOAD_FILE_RENAMED = 6
+    REQUEST_UPLOAD_SET_DIR = 7
+    REQUEST_UPLOAD_FINISHED = 8
+    REQUEST_UPLOAD_CANCELED = 9
+    REQUEST_INDIVIDUAL_FILE_STARTED = 10
+    REQUEST_INDIVIDUAL_FILE_PROGRESS = 11
+    REQUEST_INDIVIDUAL_FILE_CANCELED = 12
+    REQUEST_ERROR_DATA_DIR_CANNOT_CREATE = 13
+    REQUEST_OTHER = 14
+    REQUEST_INVALID_PASSWORD = 15
 
     def __init__(self, common, is_gui, mode_settings, mode="share"):
         self.common = common
@@ -115,7 +112,7 @@ class Web:
         if self.mode == "receive":
             # Use custom WSGI middleware, to modify environ
             self.app.wsgi_app = ReceiveModeWSGIMiddleware(self.app.wsgi_app, self)
-            # Use a custom Request class to track upload progess
+            # Use a custom Request class to track upload progress
             self.app.request_class = ReceiveModeRequest
 
         # Starting in Flask 0.11, render_template_string autoescapes template variables
@@ -165,6 +162,8 @@ class Web:
             self.socketio = SocketIO()
             self.socketio.init_app(self.app)
             self.chat_mode = ChatModeWeb(self.common, self)
+
+        self.cleanup_filenames = []
 
     def get_mode(self):
         if self.mode == "share":
@@ -223,12 +222,41 @@ class Web:
 
                 return _check_login()
 
+        @self.app.after_request
+        def add_security_headers(self, r):
+            """
+            Add security headers to a response
+            """
+            for header, value in self.security_headers:
+                r.headers.set(header, value)
+            # Set a CSP header unless in website mode and the user has disabled it
+            if not self.settings.get("website", "disable_csp") or self.mode != "website":
+                r.headers.set(
+                    "Content-Security-Policy",
+                    "default-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'; img-src 'self' data:;",
+                )
+            return r
+
         @self.app.errorhandler(404)
         def not_found(e):
             mode = self.get_mode()
             history_id = mode.cur_history_id
             mode.cur_history_id += 1
             return self.error404(history_id)
+
+        @self.app.errorhandler(405)
+        def method_not_allowed(e):
+            mode = self.get_mode()
+            history_id = mode.cur_history_id
+            mode.cur_history_id += 1
+            return self.error405(history_id)
+
+        @self.app.errorhandler(500)
+        def method_not_allowed(e):
+            mode = self.get_mode()
+            history_id = mode.cur_history_id
+            mode.cur_history_id += 1
+            return self.error500(history_id)
 
         @self.app.route("/<password_candidate>/shutdown")
         def shutdown(password_candidate):
@@ -268,57 +296,47 @@ class Web:
                         "Someone has made too many wrong attempts to guess your password, so OnionShare has stopped the server. Start sharing again and send the recipient a new address to share."
                     )
 
-        r = make_response(
-            render_template("401.html", static_url_path=self.static_url_path), 401
-        )
-        return self.add_security_headers(r)
+        return render_template("401.html", static_url_path=self.static_url_path), 401
 
     def error403(self):
         self.add_request(Web.REQUEST_OTHER, request.path)
-        r = make_response(
-            render_template("403.html", static_url_path=self.static_url_path), 403
-        )
-        return self.add_security_headers(r)
+        return render_template("403.html", static_url_path=self.static_url_path), 403
 
     def error404(self, history_id):
-        self.add_request(
-            self.REQUEST_INDIVIDUAL_FILE_STARTED,
-            request.path,
-            {"id": history_id, "status_code": 404},
-        )
+        mode = self.get_mode()
+        if mode.supports_file_requests:
+            self.add_request(
+                self.REQUEST_INDIVIDUAL_FILE_STARTED,
+                request.path,
+                {"id": history_id, "status_code": 404},
+            )
 
         self.add_request(Web.REQUEST_OTHER, request.path)
-        r = make_response(
-            render_template("404.html", static_url_path=self.static_url_path), 404
-        )
-        return self.add_security_headers(r)
+        return render_template("404.html", static_url_path=self.static_url_path), 404
 
     def error405(self, history_id):
-        self.add_request(
-            self.REQUEST_INDIVIDUAL_FILE_STARTED,
-            request.path,
-            {"id": history_id, "status_code": 405},
-        )
+        mode = self.get_mode()
+        if mode.supports_file_requests:
+            self.add_request(
+                self.REQUEST_INDIVIDUAL_FILE_STARTED,
+                request.path,
+                {"id": history_id, "status_code": 405},
+            )
 
         self.add_request(Web.REQUEST_OTHER, request.path)
-        r = make_response(
-            render_template("405.html", static_url_path=self.static_url_path), 405
-        )
-        return self.add_security_headers(r)
+        return render_template("405.html", static_url_path=self.static_url_path), 405
 
-    def add_security_headers(self, r):
-        """
-        Add security headers to a request
-        """
-        for header, value in self.security_headers:
-            r.headers.set(header, value)
-        # Set a CSP header unless in website mode and the user has disabled it
-        if not self.settings.get("website", "disable_csp") or self.mode != "website":
-            r.headers.set(
-                "Content-Security-Policy",
-                "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:;",
+    def error500(self, history_id):
+        mode = self.get_mode()
+        if mode.supports_file_requests:
+            self.add_request(
+                self.REQUEST_INDIVIDUAL_FILE_STARTED,
+                request.path,
+                {"id": history_id, "status_code": 500},
             )
-        return r
+
+        self.add_request(Web.REQUEST_OTHER, request.path)
+        return render_template("500.html", static_url_path=self.static_url_path), 500
 
     def _safe_select_jinja_autoescape(self, filename):
         if filename is None:
@@ -333,7 +351,7 @@ class Web:
 
     def generate_password(self, saved_password=None):
         self.common.log("Web", "generate_password", f"saved_password={saved_password}")
-        if saved_password != None and saved_password != "":
+        if saved_password is not None and saved_password != "":
             self.password = saved_password
             self.common.log(
                 "Web",
@@ -366,12 +384,17 @@ class Web:
         # Shutdown the flask service
         try:
             func = request.environ.get("werkzeug.server.shutdown")
-            if func is None:
+            if func is None and self.mode != "chat":
                 raise RuntimeError("Not running with the Werkzeug Server")
             func()
-        except:
+        except Exception:
             pass
+
         self.running = False
+
+        # If chat, shutdown the socket server
+        if self.mode == "chat":
+            self.socketio.stop()
 
     def start(self, port):
         """
@@ -422,3 +445,21 @@ class Web:
 
         # Reset any password that was in use
         self.password = None
+
+    def cleanup(self):
+        """
+        Shut everything down and clean up temporary files, etc.
+        """
+        self.common.log("Web", "cleanup")
+
+        # Cleanup files
+        try:
+            for filename in self.cleanup_filenames:
+                if os.path.isfile(filename):
+                    os.remove(filename)
+                elif os.path.isdir(filename):
+                    shutil.rmtree(filename)
+        except Exception:
+            # Don't crash if file is still in use
+            pass
+        self.cleanup_filenames = []
